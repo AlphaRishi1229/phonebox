@@ -29,7 +29,7 @@ public sealed partial class AudioControl
     private long _seq, _written; // read tickets: a reading only lands if no later-started read has landed
     // the generation the running background read belongs to, -1 while none runs: a read for a newer generation (another
     // output was chosen) starts at once instead of waiting for one of the old output, which can take seconds
-    private long _refreshingGen = -1;
+    private long _refreshingGen = -1; // guarded by _lock
 
     private const int SetTimeoutMs = 8000; // a busy computer can need seconds; giving up kills the helper and nothing is set
     private readonly Func<int, int?>? _set; // the level reached, or null when the write failed
@@ -49,7 +49,7 @@ public sealed partial class AudioControl
     internal static long FailedReadMaxAgeMs(int failures) =>
         Math.Min((long)SlowReadMaxAgeMs << Math.Clamp(failures - 1, 0, 16), FailedReadCapMs);
 
-    internal bool Refreshing => Interlocked.Read(ref _refreshingGen) != -1;
+    internal bool Refreshing { get { lock (_lock) return _refreshingGen != -1; } }
 
     /// <summary>
     /// The last reading, refreshed in the background. Never waits for osascript / wpctl / pactl: the live stream
@@ -57,27 +57,32 @@ public sealed partial class AudioControl
     /// </summary>
     public AudioSnapshot? Snapshot()
     {
-        long at, gen; AudioSnapshot? cached; int failures;
+        long gen, ticket = 0; AudioSnapshot? cached; var start = false;
         var output = _outputId?.Invoke();
+        // the generation is read and its gate claimed in one hold of the lock: a caller that saw an older generation must
+        // not take a newer read's gate (that would start a second helper for the same output)
         lock (_lock)
         {
             // another output was chosen: what the old one did says nothing about it, so read it now and drop reads in flight
             if (output != _lastOutput) { _lastOutput = output; _failures = 0; _at = 0; _gen++; }
-            at = _at; cached = _cached; failures = _failures; gen = _gen;
+            cached = _cached; gen = _gen;
+            var maxAge = !_slowReadsForUncontrollable || cached is { CanControl: true } ? MaxAgeMs
+                : cached is null ? FailedReadMaxAgeMs(_failures)
+                : SlowReadMaxAgeMs;
+            // _at == 0 is "never read or invalidated", not a time: soon after boot the uptime clock is below maxAge
+            if ((_at == 0 || Environment.TickCount64 - _at >= maxAge) && _refreshingGen != gen)
+            {
+                _refreshingGen = gen; ticket = ++_seq; start = true;
+            }
         }
-        var maxAge = !_slowReadsForUncontrollable || cached is { CanControl: true } ? MaxAgeMs
-            : cached is null ? FailedReadMaxAgeMs(failures)
-            : SlowReadMaxAgeMs;
-        // at == 0 is "never read or invalidated", not a time: soon after boot the uptime clock is below maxAge
-        var running = Interlocked.Read(ref _refreshingGen);
-        if ((at == 0 || Environment.TickCount64 - at >= maxAge) && running != gen
-            && Interlocked.CompareExchange(ref _refreshingGen, gen, running) == running)
+        if (start)
             _ = Task.Run(() =>
             {
-                try { var (ticket, readGen) = BeginRead(); Store(ticket, readGen, _read()); }
+                // the read belongs to the generation whose gate it holds; if that moved on, Store drops it
+                try { Store(ticket, gen, _read()); }
                 catch { }
                 // only its own gate: a read for a newer generation may have started meanwhile and still be running
-                finally { Interlocked.CompareExchange(ref _refreshingGen, -1, gen); }
+                finally { lock (_lock) if (_refreshingGen == gen) _refreshingGen = -1; }
             });
         return cached;
     }
