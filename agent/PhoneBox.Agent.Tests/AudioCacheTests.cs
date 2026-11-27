@@ -17,6 +17,28 @@ public class AudioCacheTests
         Assert.Equal(42, audio.Snapshot()?.Volume);
     }
 
+    [Theory]
+    [InlineData(true, 2)]  // read in-process: refreshed after 900 ms
+    [InlineData(false, 1)] // read by starting osascript: kept for 10 s, not re-read every second
+    [InlineData(null, 1)]  // no reading at all (osascript said "missing value"): tried again after 10 s
+    public void OnlyAControllableOutputIsReadEverySecond(bool? canControl, int expectedReads)
+    {
+        var reads = 0;
+        var audio = new AudioControl(() =>
+        {
+            Interlocked.Increment(ref reads);
+            return canControl is { } can ? new AudioSnapshot(42, false, can) : null;
+        });
+
+        audio.Snapshot();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref reads) == 1 && !audio.Refreshing, TimeSpan.FromSeconds(10)));
+        Thread.Sleep(1100); // past the 900 ms of a controllable output, well inside the 10 s of the other kind
+        audio.Snapshot();
+        Assert.True(SpinWait.SpinUntil(() => !audio.Refreshing, TimeSpan.FromSeconds(10)));
+
+        Assert.Equal(expectedReads, Volatile.Read(ref reads));
+    }
+
     [Fact]
     public void AnOlderBackgroundReadCannotReplaceANewerCurrentReading()
     {
