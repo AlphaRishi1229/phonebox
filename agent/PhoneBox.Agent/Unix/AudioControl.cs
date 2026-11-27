@@ -13,9 +13,14 @@ public sealed partial class AudioControl
     // An output macOS cannot control in-process (a display's or soundbar's own volume over HDMI) is read by starting
     // osascript, and every start registers a new app with WindowServer. At one reading a second, WindowServer's Mach port
     // count grew until it hit its limit after a few days; WindowServer then exited and the user was logged out. Such an
-    // output cannot be set from the phone anyway, and often has no reading at all (osascript says "missing value"), so it
-    // and a failed reading are read again after 10 s, not every second.
+    // output cannot be set from the phone anyway, so it is read again after 10 s, not every second.
     private const int SlowReadMaxAgeMs = 10_000;
+    // An output with no reading at all (on HDMI osascript says "missing value" every time) waits twice as long after each
+    // empty reading, up to 5 minutes; choosing another output starts over at once.
+    private const long FailedReadCapMs = 300_000;
+    private readonly Func<uint?>? _outputId; // the selected output, read in-process (no helper)
+    private uint? _lastOutput;
+    private int _failures;     // readings in a row that came back empty
     private readonly Lock _lock = new();
     private readonly Func<AudioSnapshot?> _read;
     private AudioSnapshot? _cached;
@@ -31,11 +36,16 @@ public sealed partial class AudioControl
     // only macOS reads through osascript; on Linux a missing reading is a sink that is briefly gone and is retried at once
     private readonly bool _slowReadsForUncontrollable;
 
-    public AudioControl() : this(Read, null, null, OperatingSystem.IsMacOS()) { }
+    public AudioControl() : this(Read, null, null, OperatingSystem.IsMacOS(), OperatingSystem.IsMacOS() ? () => MacAudioProbe.SelectedOutput()?.Id : null) { }
 
     /// <summary>For tests: a fake reader (and optionally setter and mute toggle) instead of osascript / wpctl / pactl.</summary>
-    internal AudioControl(Func<AudioSnapshot?> read, Func<int, int?>? set = null, Func<bool>? toggleMute = null, bool slowReadsForUncontrollable = false)
-    { _read = read; _set = set; _toggleMute = toggleMute; _slowReadsForUncontrollable = slowReadsForUncontrollable; }
+    internal AudioControl(Func<AudioSnapshot?> read, Func<int, int?>? set = null, Func<bool>? toggleMute = null, bool slowReadsForUncontrollable = false,
+        Func<uint?>? outputId = null)
+    { _read = read; _set = set; _toggleMute = toggleMute; _slowReadsForUncontrollable = slowReadsForUncontrollable; _outputId = outputId; }
+
+    /// <summary>How long an empty reading is kept after this many empty readings in a row: 10 s, 20 s, 40 s ... up to 5 minutes.</summary>
+    internal static long FailedReadMaxAgeMs(int failures) =>
+        Math.Min((long)SlowReadMaxAgeMs << Math.Clamp(failures - 1, 0, 16), FailedReadCapMs);
 
     internal bool Refreshing => Volatile.Read(ref _refreshing) == 1;
 
@@ -45,9 +55,17 @@ public sealed partial class AudioControl
     /// </summary>
     public AudioSnapshot? Snapshot()
     {
-        long at; AudioSnapshot? cached;
-        lock (_lock) { at = _at; cached = _cached; }
-        var maxAge = _slowReadsForUncontrollable && cached is not { CanControl: true } ? SlowReadMaxAgeMs : MaxAgeMs;
+        long at; AudioSnapshot? cached; int failures;
+        var output = _outputId?.Invoke();
+        lock (_lock)
+        {
+            // another output was chosen: what the old one did says nothing about it, so read it now and drop reads in flight
+            if (output != _lastOutput) { _lastOutput = output; _failures = 0; _at = 0; _gen++; }
+            at = _at; cached = _cached; failures = _failures;
+        }
+        var maxAge = !_slowReadsForUncontrollable || cached is { CanControl: true } ? MaxAgeMs
+            : cached is null ? FailedReadMaxAgeMs(failures)
+            : SlowReadMaxAgeMs;
         // at == 0 is "never read or invalidated", not a time: soon after boot the uptime clock is below maxAge
         if ((at == 0 || Environment.TickCount64 - at >= maxAge) && Interlocked.CompareExchange(ref _refreshing, 1, 0) == 0)
             _ = Task.Run(() =>
@@ -81,6 +99,7 @@ public sealed partial class AudioControl
             // the volume moved from outside (the keyboard's volume keys, another app): the phone should see it now
             changed = _cached is not null && s is not null && (_cached.Volume != s.Volume || _cached.Muted != s.Muted);
             _written = ticket; _cached = s; _at = Environment.TickCount64;
+            _failures = s is null ? _failures + 1 : 0;
         }
         if (changed) StateSignal.Poke();
     }

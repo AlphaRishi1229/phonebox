@@ -40,6 +40,35 @@ public class AudioCacheTests
         Assert.Equal(expectedReads, Volatile.Read(ref reads));
     }
 
+    [Theory]
+    [InlineData(0, 10_000)]
+    [InlineData(1, 10_000)]
+    [InlineData(2, 20_000)]
+    [InlineData(5, 160_000)]
+    [InlineData(6, 300_000)]  // capped at 5 minutes
+    [InlineData(1000, 300_000)]
+    public void AnEmptyReadingWaitsTwiceAsLongEachTime(int failures, long expectedMs) =>
+        Assert.Equal(expectedMs, AudioControl.FailedReadMaxAgeMs(failures));
+
+    [Fact]
+    public void ChoosingAnotherOutputReadsItAtOnce()
+    {
+        var reads = 0;
+        uint output = 1;
+        var audio = new AudioControl(() => { Interlocked.Increment(ref reads); return null; },
+            slowReadsForUncontrollable: true, outputId: () => output);
+
+        audio.Snapshot();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref reads) == 1 && !audio.Refreshing, TimeSpan.FromSeconds(10)));
+        audio.Snapshot(); // empty, so kept for 10 s: no second read
+        Assert.True(SpinWait.SpinUntil(() => !audio.Refreshing, TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, Volatile.Read(ref reads));
+
+        output = 2; // e.g. from the display's speakers to headphones
+        audio.Snapshot();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref reads) == 2 && !audio.Refreshing, TimeSpan.FromSeconds(10)));
+    }
+
     [Fact]
     public void AnOlderBackgroundReadCannotReplaceANewerCurrentReading()
     {
