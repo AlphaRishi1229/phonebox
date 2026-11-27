@@ -70,6 +70,28 @@ public class AudioCacheTests
     }
 
     [Fact]
+    public void ChoosingAnotherOutputDoesNotWaitForAReadOfTheOldOne()
+    {
+        using var release = new ManualResetEventSlim(false);
+        var reads = 0;
+        uint output = 1;
+        var audio = new AudioControl(() =>
+        {
+            if (Interlocked.Increment(ref reads) == 1) release.Wait(TimeSpan.FromSeconds(10)); // the old output's read is slow
+            return null;
+        }, slowReadsForUncontrollable: true, outputId: () => output);
+
+        audio.Snapshot();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref reads) == 1, TimeSpan.FromSeconds(10)));
+        output = 2;
+        audio.Snapshot(); // the new output is read now, while the old read is still blocked
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref reads) == 2, TimeSpan.FromSeconds(5)));
+
+        release.Set();
+        Assert.True(SpinWait.SpinUntil(() => !audio.Refreshing, TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
     public void AnOlderBackgroundReadCannotReplaceANewerCurrentReading()
     {
         using var started = new ManualResetEventSlim(false);
